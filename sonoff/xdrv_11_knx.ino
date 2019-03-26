@@ -1,7 +1,7 @@
 /*
   xdrv_11_knx.ino - KNX IP Protocol support for Sonoff-Tasmota
 
-  Copyright (C) 2018  Adrian Scillato  (https://github.com/ascillato)
+  Copyright (C) 2019  Adrian Scillato  (https://github.com/ascillato)
 
   This program is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -39,34 +39,33 @@ Variables in settings.h
 
 bool          Settings.flag.knx_enabled             Enable/Disable KNX Protocol
 uint16_t      Settings.knx_physsical_addr           Physical KNX address of this device
-byte          Settings.knx_GA_registered            Number of group address to read
-byte          Settings.knx_CB_registered            Number of group address to write
+uint8_t       Settings.knx_GA_registered            Number of group address to read
+uint8_t       Settings.knx_CB_registered            Number of group address to write
 uint16_t      Settings.knx_GA_addr[MAX_KNX_GA]      Group address to read
 uint16_t      Settings.knx_CB_addr[MAX_KNX_CB]      Group address to write
-byte          Settings.knx_GA_param[MAX_KNX_GA]     Type of Input (relay changed, button pressed, sensor read)
-byte          Settings.knx_CB_param[MAX_KNX_CB]     Type of Output (set relay, toggle relay, reply sensor value)
+uint8_t       Settings.knx_GA_param[MAX_KNX_GA]     Type of Input (relay changed, button pressed, sensor read)
+uint8_t       Settings.knx_CB_param[MAX_KNX_CB]     Type of Output (set relay, toggle relay, reply sensor value)
 
 \*********************************************************************************************/
 
-#include <esp-knx-ip.h>
+#define XDRV_11  11
 
-//void KNX_CB_Action(message_t const &msg, void *arg);  // Define function (action callback) to be called by the KNX_IP Library
-                                                      // when an action is requested by another KNX Device
+#include <esp-knx-ip.h>         // KNX Library
 
 address_t KNX_physs_addr;  // Physical KNX address of this device
 address_t KNX_addr;        // KNX Address converter variable
 
 #define KNX_Empty 255
-#define KNX_TEMPERATURE 17
-#define KNX_HUMIDITY 18
-#define KNX_MAX_device_param 18
+
+#define TOGGLE_INHIBIT_TIME 15 // 15*50mseg = 750mseg (inhibit time for not toggling again relays by a KNX toggle command)
 
 float last_temp;
 float last_hum;
+uint8_t toggle_inhibit;
 
 typedef struct __device_parameters
 {
-  byte type;           // PARAMETER_ID. Used as type of GA = relay, button, sensor, etc, (INPUTS)
+  uint8_t type;        // PARAMETER_ID. Used as type of GA = relay, button, sensor, etc, (INPUTS)
                        // used when an action on device triggers a MSG to send on KNX
                        // Needed because this is the value that the ESP_KNX_IP library will pass as parameter
                        // to identify the action to perform when a MSG is received
@@ -103,19 +102,31 @@ device_parameters_t device_param[] = {
   { 16, false, false, KNX_Empty }, // device_param[15] = Button 8
   { KNX_TEMPERATURE, false, false, KNX_Empty }, // device_param[16] = Temperature
   { KNX_HUMIDITY   , false, false, KNX_Empty }, // device_param[17] = humidity
+  { KNX_ENERGY_VOLTAGE   , false, false, KNX_Empty },
+  { KNX_ENERGY_CURRENT   , false, false, KNX_Empty },
+  { KNX_ENERGY_POWER   , false, false, KNX_Empty },
+  { KNX_ENERGY_POWERFACTOR   , false, false, KNX_Empty },
+  { KNX_ENERGY_DAILY   , false, false, KNX_Empty },
+  { KNX_ENERGY_START   , false, false, KNX_Empty },
+  { KNX_ENERGY_TOTAL   , false, false, KNX_Empty },
+  { KNX_SLOT1 , false, false, KNX_Empty },
+  { KNX_SLOT2 , false, false, KNX_Empty },
+  { KNX_SLOT3 , false, false, KNX_Empty },
+  { KNX_SLOT4 , false, false, KNX_Empty },
+  { KNX_SLOT5 , false, false, KNX_Empty },
   { KNX_Empty, false, false, KNX_Empty}
 };
 
 // device parameters (information that can be sent)
 const char * device_param_ga[] = {
-  D_SENSOR_RELAY  " 1",   // Relay 1
-  D_SENSOR_RELAY  " 2",   // Relay 2
-  D_SENSOR_RELAY  " 3",   // Relay 3
-  D_SENSOR_RELAY  " 4",   // Relay 4
-  D_SENSOR_RELAY  " 5",   // Relay 5
-  D_SENSOR_RELAY  " 6",   // Relay 6
-  D_SENSOR_RELAY  " 7",   // Relay 7
-  D_SENSOR_RELAY  " 8",   // Relay 8
+  D_TIMER_OUTPUT  " 1",   // Relay 1
+  D_TIMER_OUTPUT  " 2",   // Relay 2
+  D_TIMER_OUTPUT  " 3",   // Relay 3
+  D_TIMER_OUTPUT  " 4",   // Relay 4
+  D_TIMER_OUTPUT  " 5",   // Relay 5
+  D_TIMER_OUTPUT  " 6",   // Relay 6
+  D_TIMER_OUTPUT  " 7",   // Relay 7
+  D_TIMER_OUTPUT  " 8",   // Relay 8
   D_SENSOR_BUTTON " 1",   // Button 1
   D_SENSOR_BUTTON " 2",   // Button 2
   D_SENSOR_BUTTON " 3",   // Button 3
@@ -126,36 +137,72 @@ const char * device_param_ga[] = {
   D_SENSOR_BUTTON " 8",   // Button 8
   D_TEMPERATURE       ,   // Temperature
   D_HUMIDITY          ,   // Humidity
+  D_VOLTAGE           ,
+  D_CURRENT           ,
+  D_POWERUSAGE        ,
+  D_POWER_FACTOR      ,
+  D_ENERGY_TODAY      ,
+  D_ENERGY_YESTERDAY  ,
+  D_ENERGY_TOTAL      ,
+  D_KNX_TX_SLOT   " 1",
+  D_KNX_TX_SLOT   " 2",
+  D_KNX_TX_SLOT   " 3",
+  D_KNX_TX_SLOT   " 4",
+  D_KNX_TX_SLOT   " 5",
   nullptr
 };
 
 // device actions (posible actions to be performed on the device)
 const char *device_param_cb[] = {
-  D_SENSOR_RELAY " 1", // Set Relay 1 (1-On or 0-OFF)
-  D_SENSOR_RELAY " 2",
-  D_SENSOR_RELAY " 3",
-  D_SENSOR_RELAY " 4",
-  D_SENSOR_RELAY " 5",
-  D_SENSOR_RELAY " 6",
-  D_SENSOR_RELAY " 7",
-  D_SENSOR_RELAY " 8",
-  D_SENSOR_RELAY " 1 " D_BUTTON_TOGGLE, // Relay 1 Toggle (1 or 0 will toggle)
-  D_SENSOR_RELAY " 2 " D_BUTTON_TOGGLE,
-  D_SENSOR_RELAY " 3 " D_BUTTON_TOGGLE,
-  D_SENSOR_RELAY " 4 " D_BUTTON_TOGGLE,
-  D_SENSOR_RELAY " 5 " D_BUTTON_TOGGLE,
-  D_SENSOR_RELAY " 6 " D_BUTTON_TOGGLE,
-  D_SENSOR_RELAY " 7 " D_BUTTON_TOGGLE,
-  D_SENSOR_RELAY " 8 " D_BUTTON_TOGGLE,
+  D_TIMER_OUTPUT " 1", // Set Relay 1 (1-On or 0-OFF)
+  D_TIMER_OUTPUT " 2",
+  D_TIMER_OUTPUT " 3",
+  D_TIMER_OUTPUT " 4",
+  D_TIMER_OUTPUT " 5",
+  D_TIMER_OUTPUT " 6",
+  D_TIMER_OUTPUT " 7",
+  D_TIMER_OUTPUT " 8",
+  D_TIMER_OUTPUT " 1 " D_BUTTON_TOGGLE, // Relay 1 Toggle (1 or 0 will toggle)
+  D_TIMER_OUTPUT " 2 " D_BUTTON_TOGGLE,
+  D_TIMER_OUTPUT " 3 " D_BUTTON_TOGGLE,
+  D_TIMER_OUTPUT " 4 " D_BUTTON_TOGGLE,
+  D_TIMER_OUTPUT " 5 " D_BUTTON_TOGGLE,
+  D_TIMER_OUTPUT " 6 " D_BUTTON_TOGGLE,
+  D_TIMER_OUTPUT " 7 " D_BUTTON_TOGGLE,
+  D_TIMER_OUTPUT " 8 " D_BUTTON_TOGGLE,
   D_REPLY " " D_TEMPERATURE, // Reply Temperature
   D_REPLY " " D_HUMIDITY,    // Reply Humidity
+  D_REPLY " " D_VOLTAGE           ,
+  D_REPLY " " D_CURRENT           ,
+  D_REPLY " " D_POWERUSAGE        ,
+  D_REPLY " " D_POWER_FACTOR      ,
+  D_REPLY " " D_ENERGY_TODAY      ,
+  D_REPLY " " D_ENERGY_YESTERDAY  ,
+  D_REPLY " " D_ENERGY_TOTAL      ,
+  D_KNX_RX_SLOT   " 1",
+  D_KNX_RX_SLOT   " 2",
+  D_KNX_RX_SLOT   " 3",
+  D_KNX_RX_SLOT   " 4",
+  D_KNX_RX_SLOT   " 5",
   nullptr
 };
 
+// Commands
+#define D_CMND_KNXTXCMND "KnxTx_Cmnd"
+#define D_CMND_KNXTXVAL "KnxTx_Val"
+#define D_CMND_KNX_ENABLED "Knx_Enabled"
+#define D_CMND_KNX_ENHANCED "Knx_Enhanced"
+#define D_CMND_KNX_PA "Knx_PA"
+#define D_CMND_KNX_GA "Knx_GA"
+#define D_CMND_KNX_CB "Knx_CB"
+enum KnxCommands { CMND_KNXTXCMND, CMND_KNXTXVAL, CMND_KNX_ENABLED, CMND_KNX_ENHANCED, CMND_KNX_PA,
+                   CMND_KNX_GA, CMND_KNX_CB } ;
+const char kKnxCommands[] PROGMEM = D_CMND_KNXTXCMND "|" D_CMND_KNXTXVAL "|" D_CMND_KNX_ENABLED "|"
+                   D_CMND_KNX_ENHANCED "|" D_CMND_KNX_PA "|" D_CMND_KNX_GA "|" D_CMND_KNX_CB ;
 
-byte KNX_GA_Search( byte param, byte start = 0 )
+uint8_t KNX_GA_Search( uint8_t param, uint8_t start = 0 )
 {
-  for (byte i = start; i < Settings.knx_GA_registered; ++i)
+  for (uint8_t i = start; i < Settings.knx_GA_registered; ++i)
   {
     if ( Settings.knx_GA_param[i] == param )
     {
@@ -169,9 +216,9 @@ byte KNX_GA_Search( byte param, byte start = 0 )
 }
 
 
-byte KNX_CB_Search( byte param, byte start = 0 )
+uint8_t KNX_CB_Search( uint8_t param, uint8_t start = 0 )
 {
-  for (byte i = start; i < Settings.knx_CB_registered; ++i)
+  for (uint8_t i = start; i < Settings.knx_CB_registered; ++i)
   {
     if ( Settings.knx_CB_param[i] == param )
     {
@@ -185,7 +232,7 @@ byte KNX_CB_Search( byte param, byte start = 0 )
 }
 
 
-void KNX_ADD_GA( byte GAop, byte GA_FNUM, byte GA_AREA, byte GA_FDEF )
+void KNX_ADD_GA( uint8_t GAop, uint8_t GA_FNUM, uint8_t GA_AREA, uint8_t GA_FDEF )
 {
   // Check if all GA were assigned. If yes-> return
   if ( Settings.knx_GA_registered >= MAX_KNX_GA ) { return; }
@@ -200,20 +247,19 @@ void KNX_ADD_GA( byte GAop, byte GA_FNUM, byte GA_AREA, byte GA_FDEF )
 
   Settings.knx_GA_registered++;
 
-  snprintf_P(log_data, sizeof(log_data), PSTR(D_LOG_KNX D_ADD " GA #%d: %s " D_TO " %d/%d/%d"),
+  AddLog_P2(LOG_LEVEL_DEBUG, PSTR(D_LOG_KNX D_ADD " GA #%d: %s " D_TO " %d/%d/%d"),
    Settings.knx_GA_registered,
    device_param_ga[GAop-1],
    GA_FNUM, GA_AREA, GA_FDEF );
-  AddLog(LOG_LEVEL_DEBUG);
 }
 
 
-void KNX_DEL_GA( byte GAnum )
+void KNX_DEL_GA( uint8_t GAnum )
 {
 
-  byte dest_offset = 0;
-  byte src_offset = 0;
-  byte len = 0;
+  uint8_t dest_offset = 0;
+  uint8_t src_offset = 0;
+  uint8_t len = 0;
 
   // Delete GA
   Settings.knx_GA_param[GAnum-1] = 0;
@@ -244,19 +290,18 @@ void KNX_DEL_GA( byte GAnum )
 
   if (len > 0)
   {
-    memmove(Settings.knx_GA_param + dest_offset, Settings.knx_GA_param + src_offset, len * sizeof(byte));
+    memmove(Settings.knx_GA_param + dest_offset, Settings.knx_GA_param + src_offset, len * sizeof(uint8_t));
     memmove(Settings.knx_GA_addr + dest_offset, Settings.knx_GA_addr + src_offset, len * sizeof(uint16_t));
   }
 
   Settings.knx_GA_registered--;
 
-  snprintf_P(log_data, sizeof(log_data), PSTR(D_LOG_KNX D_DELETE " GA #%d"),
+  AddLog_P2(LOG_LEVEL_DEBUG, PSTR(D_LOG_KNX D_DELETE " GA #%d"),
     GAnum );
-  AddLog(LOG_LEVEL_DEBUG);
 }
 
 
-void KNX_ADD_CB( byte CBop, byte CB_FNUM, byte CB_AREA, byte CB_FDEF )
+void KNX_ADD_CB( uint8_t CBop, uint8_t CB_FNUM, uint8_t CB_AREA, uint8_t CB_FDEF )
 {
   // Check if all callbacks were assigned. If yes-> return
   if ( Settings.knx_CB_registered >= MAX_KNX_CB ) { return; }
@@ -283,20 +328,19 @@ void KNX_ADD_CB( byte CBop, byte CB_FNUM, byte CB_AREA, byte CB_FDEF )
 
   Settings.knx_CB_registered++;
 
-  snprintf_P(log_data, sizeof(log_data), PSTR(D_LOG_KNX D_ADD " CB #%d: %d/%d/%d " D_TO " %s"),
+  AddLog_P2(LOG_LEVEL_DEBUG, PSTR(D_LOG_KNX D_ADD " CB #%d: %d/%d/%d " D_TO " %s"),
    Settings.knx_CB_registered,
    CB_FNUM, CB_AREA, CB_FDEF,
    device_param_cb[CBop-1] );
-  AddLog(LOG_LEVEL_DEBUG);
 }
 
 
-void KNX_DEL_CB( byte CBnum )
+void KNX_DEL_CB( uint8_t CBnum )
 {
-  byte oldparam = Settings.knx_CB_param[CBnum-1];
-  byte dest_offset = 0;
-  byte src_offset = 0;
-  byte len = 0;
+  uint8_t oldparam = Settings.knx_CB_param[CBnum-1];
+  uint8_t dest_offset = 0;
+  uint8_t src_offset = 0;
+  uint8_t len = 0;
 
   // Delete assigment
   knx.callback_unassign(CBnum-1);
@@ -328,7 +372,7 @@ void KNX_DEL_CB( byte CBnum )
 
   if (len > 0)
   {
-    memmove(Settings.knx_CB_param + dest_offset, Settings.knx_CB_param + src_offset, len * sizeof(byte));
+    memmove(Settings.knx_CB_param + dest_offset, Settings.knx_CB_param + src_offset, len * sizeof(uint8_t));
     memmove(Settings.knx_CB_addr + dest_offset, Settings.knx_CB_addr + src_offset, len * sizeof(uint16_t));
   }
 
@@ -340,38 +384,68 @@ void KNX_DEL_CB( byte CBnum )
     device_param[oldparam-1].CB_id =  KNX_Empty;
   }
 
-  snprintf_P(log_data, sizeof(log_data), PSTR(D_LOG_KNX D_DELETE " CB #%d"), CBnum );
-  AddLog(LOG_LEVEL_DEBUG);
+  AddLog_P2(LOG_LEVEL_DEBUG, PSTR(D_LOG_KNX D_DELETE " CB #%d"), CBnum );
 }
 
 
-bool KNX_CONFIG_NOT_MATCH()
+bool KNX_CONFIG_NOT_MATCH(void)
 {
-  for (byte i = 0; i < KNX_MAX_device_param; ++i)
+  // Check for configured parameters that the device does not have (module changed)
+  for (uint8_t i = 0; i < KNX_MAX_device_param; ++i)
   {
     if ( !device_param[i].show ) { // device has this parameter ?
       // if not, search for all registered group address to this parameter for deletion
+
+      // Checks all GA
       if ( KNX_GA_Search(i+1) != KNX_Empty ) { return true; }
-      if ( (i < 8) || (i > 15) ) // check relays and sensors (i from 8 to 16 are toggle relays parameters)
+      // Check all CB
+      if ( i < 8 ) // check relays (i from 8 to 15 are toggle relays parameters)
       {
         if ( KNX_CB_Search(i+1) != KNX_Empty ) { return true; }
         if ( KNX_CB_Search(i+9) != KNX_Empty ) { return true; }
       }
+      // check sensors and others
+      if ( i > 15 )
+      {
+        if ( KNX_CB_Search(i+1) != KNX_Empty ) { return true; }
+      }
     }
   }
+
+  // Check for invalid or erroneous configuration (tasmota flashed without clearing the memory)
+  for (uint8_t i = 0; i < Settings.knx_GA_registered; ++i)
+  {
+    if ( Settings.knx_GA_param[i] != 0 ) // the GA[i] have a parameter defined?
+    {
+      if ( Settings.knx_GA_addr[i] == 0 ) // the GA[i] with parameter have the 0/0/0 as address?
+      {
+         return true; // So, it is invalid. Reset KNX configuration
+      }
+    }
+  }
+  for (uint8_t i = 0; i < Settings.knx_CB_registered; ++i)
+  {
+    if ( Settings.knx_CB_param[i] != 0 ) // the CB[i] have a parameter defined?
+    {
+      if ( Settings.knx_CB_addr[i] == 0 ) // the CB[i] with parameter have the 0/0/0 as address?
+      {
+         return true; // So, it is invalid. Reset KNX configuration
+      }
+    }
+  }
+
   return false;
 }
 
 
-void KNXStart()
+void KNXStart(void)
 {
   knx.start(nullptr);
-  snprintf_P(log_data, sizeof(log_data), PSTR(D_LOG_KNX D_START));
-  AddLog(LOG_LEVEL_DEBUG);
+  AddLog_P2(LOG_LEVEL_DEBUG, PSTR(D_LOG_KNX D_START));
 }
 
 
-void KNX_INIT()
+void KNX_INIT(void)
 {
   // Check for incompatible config
   if (Settings.knx_GA_registered > MAX_KNX_GA) { Settings.knx_GA_registered = MAX_KNX_GA; }
@@ -384,42 +458,73 @@ void KNX_INIT()
   // Read Configuration
   //   Check which relays, buttons and sensors where configured for this device
   //   and activate options according to the hardware
-  for (int i = GPIO_REL1; i < GPIO_REL8 + 1; ++i)
+  /*for (int i = GPIO_REL1; i < GPIO_REL8 + 1; ++i)
   {
-    if (GetUsedInModule(i, my_module.gp.io)) { device_param[i - GPIO_REL1].show = true; }
+    if (GetUsedInModule(i, my_module.io)) { device_param[i - GPIO_REL1].show = true; }
   }
   for (int i = GPIO_REL1_INV; i < GPIO_REL8_INV + 1; ++i)
   {
-    if (GetUsedInModule(i, my_module.gp.io)) { device_param[i - GPIO_REL1_INV].show = true; }
+    if (GetUsedInModule(i, my_module.io)) { device_param[i - GPIO_REL1_INV].show = true; }
+  }*/
+  for (int i = 0; i < devices_present; ++i)
+  {
+    device_param[i].show = true;
   }
   for (int i = GPIO_SWT1; i < GPIO_SWT4 + 1; ++i)
   {
-    if (GetUsedInModule(i, my_module.gp.io)) { device_param[i - GPIO_SWT1 + 8].show = true; }
+    if (GetUsedInModule(i, my_module.io)) { device_param[i - GPIO_SWT1 + 8].show = true; }
   }
   for (int i = GPIO_KEY1; i < GPIO_KEY4 + 1; ++i)
   {
-    if (GetUsedInModule(i, my_module.gp.io)) { device_param[i - GPIO_KEY1 + 8].show = true; }
+    if (GetUsedInModule(i, my_module.io)) { device_param[i - GPIO_KEY1 + 8].show = true; }
   }
-  if (GetUsedInModule(GPIO_DHT11, my_module.gp.io)) { device_param[KNX_TEMPERATURE-1].show = true; }
-  if (GetUsedInModule(GPIO_DHT22, my_module.gp.io)) { device_param[KNX_TEMPERATURE-1].show = true; }
-  if (GetUsedInModule(GPIO_SI7021, my_module.gp.io)) { device_param[KNX_TEMPERATURE-1].show = true; }
-  if (GetUsedInModule(GPIO_DHT11, my_module.gp.io)) { device_param[KNX_HUMIDITY-1].show = true; }
-  if (GetUsedInModule(GPIO_DHT22, my_module.gp.io)) { device_param[KNX_HUMIDITY-1].show = true; }
-  if (GetUsedInModule(GPIO_SI7021, my_module.gp.io)) { device_param[KNX_HUMIDITY-1].show = true; }
+  for (int i = GPIO_SWT1_NP; i < GPIO_SWT4_NP + 1; ++i)
+  {
+    if (GetUsedInModule(i, my_module.io)) { device_param[i - GPIO_SWT1_NP + 8].show = true; }
+  }
+  for (int i = GPIO_KEY1_NP; i < GPIO_KEY4_NP + 1; ++i)
+  {
+    if (GetUsedInModule(i, my_module.io)) { device_param[i - GPIO_KEY1_NP + 8].show = true; }
+  }
+  if (GetUsedInModule(GPIO_DHT11, my_module.io)) { device_param[KNX_TEMPERATURE-1].show = true; }
+  if (GetUsedInModule(GPIO_DHT22, my_module.io)) { device_param[KNX_TEMPERATURE-1].show = true; }
+  if (GetUsedInModule(GPIO_SI7021, my_module.io)) { device_param[KNX_TEMPERATURE-1].show = true; }
+  if (GetUsedInModule(GPIO_DSB, my_module.io)) { device_param[KNX_TEMPERATURE-1].show = true; }
+  if (GetUsedInModule(GPIO_DHT11, my_module.io)) { device_param[KNX_HUMIDITY-1].show = true; }
+  if (GetUsedInModule(GPIO_DHT22, my_module.io)) { device_param[KNX_HUMIDITY-1].show = true; }
+  if (GetUsedInModule(GPIO_SI7021, my_module.io)) { device_param[KNX_HUMIDITY-1].show = true; }
+
+  // Any device with a Power Monitoring
+  if ( energy_flg != ENERGY_NONE ) {
+    device_param[KNX_ENERGY_POWER-1].show = true;
+    device_param[KNX_ENERGY_DAILY-1].show = true;
+    device_param[KNX_ENERGY_START-1].show = true;
+    device_param[KNX_ENERGY_TOTAL-1].show = true;
+    device_param[KNX_ENERGY_VOLTAGE-1].show = true;
+    device_param[KNX_ENERGY_CURRENT-1].show = true;
+    device_param[KNX_ENERGY_POWERFACTOR-1].show = true;
+  }
+
+#ifdef USE_RULES
+  device_param[KNX_SLOT1-1].show = true;
+  device_param[KNX_SLOT2-1].show = true;
+  device_param[KNX_SLOT3-1].show = true;
+  device_param[KNX_SLOT4-1].show = true;
+  device_param[KNX_SLOT5-1].show = true;
+#endif
 
   // Delete from KNX settings all configuration is not anymore related to this device
   if (KNX_CONFIG_NOT_MATCH()) {
     Settings.knx_GA_registered = 0;
     Settings.knx_CB_registered = 0;
-    snprintf_P(log_data, sizeof(log_data), PSTR(D_LOG_KNX D_DELETE " " D_KNX_PARAMETERS ));
-    AddLog(LOG_LEVEL_DEBUG);
+    AddLog_P2(LOG_LEVEL_DEBUG, PSTR(D_LOG_KNX D_DELETE " " D_KNX_PARAMETERS));
   }
 
   // Register Group Addresses to listen to
   //     Search on the settings if there is a group address set for receive KNX messages for the type: device_param[j].type
   //     If there is, register the group address on the KNX_IP Library to Receive data for Executing Callbacks
-  byte j;
-  for (byte i = 0; i < Settings.knx_CB_registered; ++i)
+  uint8_t j;
+  for (uint8_t i = 0; i < Settings.knx_CB_registered; ++i)
   {
     j = Settings.knx_CB_param[i];
     if ( j > 0 )
@@ -438,69 +543,131 @@ void KNX_INIT()
 void KNX_CB_Action(message_t const &msg, void *arg)
 {
   device_parameters_t *chan = (device_parameters_t *)arg;
-
   if (!(Settings.flag.knx_enabled)) { return; }
 
-  snprintf_P(log_data, sizeof(log_data), PSTR(D_LOG_KNX D_RECEIVED_FROM " %d.%d.%d " D_COMMAND " %s: %d " D_TO " %s"),
+  char tempchar[33];
+
+  if (msg.data_len == 1) {
+    // COMMAND
+    tempchar[0] = msg.data[0];
+    tempchar[1] = '\0';
+  }  else  {
+    // VALUE
+    float tempvar = knx.data_to_2byte_float(msg.data);
+    dtostrfd(tempvar,2,tempchar);
+  }
+  AddLog_P2(LOG_LEVEL_INFO, PSTR(D_LOG_KNX D_RECEIVED_FROM " %d.%d.%d " D_COMMAND " %s: %s " D_TO " %s"),
    msg.received_on.ga.area, msg.received_on.ga.line, msg.received_on.ga.member,
    (msg.ct == KNX_CT_WRITE) ? D_KNX_COMMAND_WRITE : (msg.ct == KNX_CT_READ) ? D_KNX_COMMAND_READ : D_KNX_COMMAND_OTHER,
-   msg.data[0],
+   tempchar,
    device_param_cb[(chan->type)-1]);
-  AddLog(LOG_LEVEL_INFO);
 
   switch (msg.ct)
   {
     case KNX_CT_WRITE:
       if (chan->type < 9) // Set Relays
       {
-        ExecuteCommandPower(chan->type, msg.data[0]);
+        ExecuteCommandPower(chan->type, msg.data[0], SRC_KNX);
       }
       else if (chan->type < 17) // Toggle Relays
       {
-        ExecuteCommandPower((chan->type) -8, 2);
+        if (!toggle_inhibit) {
+          ExecuteCommandPower((chan->type) -8, 2, SRC_KNX);
+          if (Settings.flag.knx_enable_enhancement) {
+            toggle_inhibit = TOGGLE_INHIBIT_TIME;
+          }
+        }
       }
+#ifdef USE_RULES
+      else if ((chan->type >= KNX_SLOT1) && (chan->type <= KNX_SLOT5)) // KNX RX SLOTs (write command)
+      {
+        if (!toggle_inhibit) {
+          char command[25];
+          if (msg.data_len == 1) {
+            // Command received
+            snprintf_P(command, sizeof(command), PSTR("event KNXRX_CMND%d=%d"), ((chan->type) - KNX_SLOT1 + 1 ), msg.data[0]);
+          } else {
+            // Value received
+            snprintf_P(command, sizeof(command), PSTR("event KNXRX_VAL%d=%s"), ((chan->type) - KNX_SLOT1 + 1 ), tempchar);
+          }
+          ExecuteCommand(command, SRC_KNX);
+          if (Settings.flag.knx_enable_enhancement) {
+            toggle_inhibit = TOGGLE_INHIBIT_TIME;
+          }
+        }
+      }
+#endif
       break;
+
     case KNX_CT_READ:
       if (chan->type < 9) // reply Relays status
       {
         knx.answer_1bit(msg.received_on, chan->last_state);
+        if (Settings.flag.knx_enable_enhancement) {
+          knx.answer_1bit(msg.received_on, chan->last_state);
+          knx.answer_1bit(msg.received_on, chan->last_state);
+        }
       }
-      else if (chan->type = KNX_TEMPERATURE) // Reply Temperature
+      else if (chan->type == KNX_TEMPERATURE) // Reply Temperature
       {
         knx.answer_2byte_float(msg.received_on, last_temp);
+        if (Settings.flag.knx_enable_enhancement) {
+          knx.answer_2byte_float(msg.received_on, last_temp);
+          knx.answer_2byte_float(msg.received_on, last_temp);
+        }
       }
-      else if (chan->type = KNX_HUMIDITY) // Reply Humidity
+      else if (chan->type == KNX_HUMIDITY) // Reply Humidity
       {
         knx.answer_2byte_float(msg.received_on, last_hum);
+        if (Settings.flag.knx_enable_enhancement) {
+          knx.answer_2byte_float(msg.received_on, last_hum);
+          knx.answer_2byte_float(msg.received_on, last_hum);
+        }
       }
+#ifdef USE_RULES
+      else if ((chan->type >= KNX_SLOT1) && (chan->type <= KNX_SLOT5)) // KNX RX SLOTs (read command)
+      {
+        if (!toggle_inhibit) {
+          char command[25];
+          snprintf_P(command, sizeof(command), PSTR("event KNXRX_REQ%d"), ((chan->type) - KNX_SLOT1 + 1 ) );
+          ExecuteCommand(command, SRC_KNX);
+          if (Settings.flag.knx_enable_enhancement) {
+            toggle_inhibit = TOGGLE_INHIBIT_TIME;
+          }
+        }
+      }
+#endif
       break;
   }
 }
 
 
-void KnxUpdatePowerState(byte device, power_t state)
+void KnxUpdatePowerState(uint8_t device, power_t state)
 {
   if (!(Settings.flag.knx_enabled)) { return; }
 
   device_param[device -1].last_state = bitRead(state, device -1); // power state (on/off)
 
   // Search all the registered GA that has that output (variable: device) as parameter
-  byte i = KNX_GA_Search(device);
+  uint8_t i = KNX_GA_Search(device);
   while ( i != KNX_Empty ) {
     KNX_addr.value = Settings.knx_GA_addr[i];
     knx.write_1bit(KNX_addr, device_param[device -1].last_state);
+    if (Settings.flag.knx_enable_enhancement) {
+      knx.write_1bit(KNX_addr, device_param[device -1].last_state);
+      knx.write_1bit(KNX_addr, device_param[device -1].last_state);
+    }
 
-    snprintf_P(log_data, sizeof(log_data), PSTR(D_LOG_KNX "%s = %d " D_SENT_TO " %d.%d.%d"),
+    AddLog_P2(LOG_LEVEL_INFO, PSTR(D_LOG_KNX "%s = %d " D_SENT_TO " %d.%d.%d"),
      device_param_ga[device -1], device_param[device -1].last_state,
      KNX_addr.ga.area, KNX_addr.ga.line, KNX_addr.ga.member);
-    AddLog(LOG_LEVEL_INFO);
 
     i = KNX_GA_Search(device, i + 1);
   }
 }
 
 
-void KnxSendButtonPower(byte key, byte device, byte state)
+void KnxSendButtonPower(uint8_t key, uint8_t device, uint8_t state)
 {
 // key 0 = button_topic
 // key 1 = switch_topic
@@ -514,15 +681,18 @@ void KnxSendButtonPower(byte key, byte device, byte state)
 //  {
 
 // Search all the registered GA that has that output (variable: device) as parameter
-  byte i = KNX_GA_Search(device + 8);
+  uint8_t i = KNX_GA_Search(device + 8);
   while ( i != KNX_Empty ) {
     KNX_addr.value = Settings.knx_GA_addr[i];
     knx.write_1bit(KNX_addr, !(state == 0));
+    if (Settings.flag.knx_enable_enhancement) {
+      knx.write_1bit(KNX_addr, !(state == 0));
+      knx.write_1bit(KNX_addr, !(state == 0));
+    }
 
-    snprintf_P(log_data, sizeof(log_data), PSTR(D_LOG_KNX "%s = %d " D_SENT_TO " %d.%d.%d"),
+    AddLog_P2(LOG_LEVEL_INFO, PSTR(D_LOG_KNX "%s = %d " D_SENT_TO " %d.%d.%d"),
      device_param_ga[device + 7], !(state == 0),
      KNX_addr.ga.area, KNX_addr.ga.line, KNX_addr.ga.member);
-    AddLog(LOG_LEVEL_INFO);
 
     i = KNX_GA_Search(device + 8, i + 1);
   }
@@ -530,7 +700,7 @@ void KnxSendButtonPower(byte key, byte device, byte state)
 }
 
 
-void KnxSensor(byte sensor_type, float value)
+void KnxSensor(uint8_t sensor_type, float value)
 {
   if (sensor_type == KNX_TEMPERATURE)
   {
@@ -542,15 +712,18 @@ void KnxSensor(byte sensor_type, float value)
 
   if (!(Settings.flag.knx_enabled)) { return; }
 
-  byte i = KNX_GA_Search(sensor_type);
+  uint8_t i = KNX_GA_Search(sensor_type);
   while ( i != KNX_Empty ) {
     KNX_addr.value = Settings.knx_GA_addr[i];
     knx.write_2byte_float(KNX_addr, value);
+    if (Settings.flag.knx_enable_enhancement) {
+      knx.write_2byte_float(KNX_addr, value);
+      knx.write_2byte_float(KNX_addr, value);
+    }
 
-    snprintf_P(log_data, sizeof(log_data), PSTR(D_LOG_KNX "%s " D_SENT_TO " %d.%d.%d "),
+    AddLog_P2(LOG_LEVEL_INFO, PSTR(D_LOG_KNX "%s " D_SENT_TO " %d.%d.%d "),
      device_param_ga[sensor_type -1],
      KNX_addr.ga.area, KNX_addr.ga.line, KNX_addr.ga.member);
-    AddLog(LOG_LEVEL_INFO);
 
     i = KNX_GA_Search(sensor_type, i+1);
   }
@@ -562,42 +735,50 @@ void KnxSensor(byte sensor_type, float value)
 \*********************************************************************************************/
 
 #ifdef USE_WEBSERVER
+#ifdef USE_KNX_WEB_MENU
 const char S_CONFIGURE_KNX[] PROGMEM = D_CONFIGURE_KNX;
 
+const char HTTP_BTN_MENU_KNX[] PROGMEM =
+  "<p><form action='kn' method='get'><button>" D_CONFIGURE_KNX "</button></form></p>";
+
 const char HTTP_FORM_KNX[] PROGMEM =
-  "<fieldset><legend style='text-align:left;'><b>&nbsp;" D_KNX_PARAMETERS "&nbsp;</b></legend><form method='post' action='kn'>"
+  "<fieldset style='min-width:530px;'>"
+  "<legend style='text-align:left;'><b>&nbsp;" D_KNX_PARAMETERS "&nbsp;</b></legend>"
+  "<form method='post' action='kn'>"
   "<br/><center>"
   "<b>" D_KNX_PHYSICAL_ADDRESS " </b>"
-  "<input style='width:12%;' type='number' name='area' min='0' max='15' value='{kna'> . "
-  "<input style='width:12%;' type='number' name='line' min='0' max='15' value='{knl'> . "
-  "<input style='width:12%;' type='number' name='member' min='0' max='255' value='{knm'>"
+  "<input style='width:12%%;' type='number' name='area' min='0' max='15' value='%d'> . "
+  "<input style='width:12%%;' type='number' name='line' min='0' max='15' value='%d'> . "
+  "<input style='width:12%%;' type='number' name='member' min='0' max='255' value='%d'>"
   "<br/><br/>" D_KNX_PHYSICAL_ADDRESS_NOTE "<br/><br/>"
-  "<input style='width:10%;' id='b1' name='b1' type='checkbox'";
+  "<input id='b1' name='b1' type='checkbox'";
+
+const char HTTP_FORM_KNX1[] PROGMEM =
+  "><b>" D_KNX_ENABLE "</b>&emsp;<input id='b2' name='b2' type='checkbox'";
 
 const char HTTP_FORM_KNX2[] PROGMEM =
-  "><b>" D_KNX_ENABLE "</b><br/></center><br/>"
+  "><b>" D_KNX_ENHANCEMENT "</b><br/></center><br/>"
 
   "<fieldset><center>"
   "<b>" D_KNX_GROUP_ADDRESS_TO_WRITE "</b><hr>"
 
-  "<select name='GAop' style='width:25%;'>";
+  "<select name='GAop' style='width:25%%;'>";
 
 const char HTTP_FORM_KNX_OPT[] PROGMEM =
-  "<option value='{vop}'>{nop}</option>";
+  "<option value='%d'>%s</option>";
 
 const char HTTP_FORM_KNX_GA[] PROGMEM =
-  "<input style='width:12%;' type='number' id='GAfnum' name='GAfnum' min='0' max='31' value='0'> / "
-  "<input style='width:12%;' type='number' id='GAarea' name='GAarea' min='0' max='7' value='0'> / "
-  "<input style='width:12%;' type='number' id='GAfdef' name='GAfdef' min='0' max='255' value='0'> ";
+  "<input style='width:12%%;' type='number' id='%s' name='%s' min='0' max='31' value='0'> / "
+  "<input style='width:12%%;' type='number' id='%s' name='%s' min='0' max='7' value='0'> / "
+  "<input style='width:12%%;' type='number' id='%s' name='%s' min='0' max='255' value='0'> ";
 
 const char HTTP_FORM_KNX_ADD_BTN[] PROGMEM =
-  "<button type='submit' onclick='fncbtnadd()' btndis name='btn_add' value='{btnval}' style='width:18%;'>" D_ADD "</button><br/><br/>"
-  "<table style='width:80%; font-size: 14px;'><col width='250'><col width='30'>";
+  "<button type='submit' onclick='%s()' %s name='btn_add' value='%d' style='width:18%%;'>" D_ADD "</button><br/><br/>"
+  "<table style='width:80%%; font-size: 14px;'><col width='250'><col width='30'>";
 
 const char HTTP_FORM_KNX_ADD_TABLE_ROW[] PROGMEM =
-  "<tr><td><b>{optex} -> GAfnum / GAarea / GAfdef </b></td>"
-//  "<td><button type='submit' name='btn_del_ga' value='{opval}' style='background-color: #eb1e1e;'> " D_DELETE " </button></td></tr>";
-  "<td><button type='submit' name='btn_del_ga' value='{opval}' class='button bred'> " D_DELETE " </button></td></tr>";
+  "<tr><td><b>%s -> %d / %d / %d </b></td>"
+  "<td><button type='submit' name='btn_del_ga' value='%d' class='button bred'> " D_DELETE " </button></td></tr>";
 
 const char HTTP_FORM_KNX3[] PROGMEM =
   "</table></center></fieldset><br/>"
@@ -605,24 +786,20 @@ const char HTTP_FORM_KNX3[] PROGMEM =
   "<b>" D_KNX_GROUP_ADDRESS_TO_READ "</b><hr>";
 
 const char HTTP_FORM_KNX4[] PROGMEM =
-  "-> <select name='CBop' style='width:25%;'>";
+  "-> <select name='CBop' style='width:25%%;'>";
 
 const char HTTP_FORM_KNX_ADD_TABLE_ROW2[] PROGMEM =
-  "<tr><td><b>GAfnum / GAarea / GAfdef -> {optex}</b></td>"
-//  "<td><button type='submit' name='btn_del_cb' value='{opval}' style='background-color: #eb1e1e;'> " D_DELETE " </button></td></tr>";
-  "<td><button type='submit' name='btn_del_cb' value='{opval}' class='button bred'> " D_DELETE " </button></td></tr>";
+  "<tr><td><b>%d / %d / %d -> %s</b></td>"
+  "<td><button type='submit' name='btn_del_cb' value='%d' class='button bred'> " D_DELETE " </button></td></tr>";
 
-
-void HandleKNXConfiguration()
+void HandleKNXConfiguration(void)
 {
+  if (!HttpCheckPriviledgedAccess()) { return; }
+
+  AddLog_P(LOG_LEVEL_DEBUG, S_LOG_HTTP, S_CONFIGURE_KNX);
+
   char tmp[100];
   String stmp;
-
-  if (HTTP_USER == webserver_state) {
-    HandleRoot();
-    return;
-  }
-  AddLog_P(LOG_LEVEL_DEBUG, S_LOG_HTTP, S_CONFIGURE_KNX);
 
   if ( WebServer->hasArg("save") ) {
     KNX_Save_Settings();
@@ -634,38 +811,40 @@ void HandleKNXConfiguration()
       if ( WebServer->arg("btn_add") == "1" ) {
 
         stmp = WebServer->arg("GAop"); //option selected
-        byte GAop = stmp.toInt();
+        uint8_t GAop = stmp.toInt();
         stmp = WebServer->arg("GA_FNUM");
-        byte GA_FNUM = stmp.toInt();
+        uint8_t GA_FNUM = stmp.toInt();
         stmp = WebServer->arg("GA_AREA");
-        byte GA_AREA = stmp.toInt();
+        uint8_t GA_AREA = stmp.toInt();
         stmp = WebServer->arg("GA_FDEF");
-        byte GA_FDEF = stmp.toInt();
+        uint8_t GA_FDEF = stmp.toInt();
 
-        KNX_ADD_GA( GAop, GA_FNUM, GA_AREA, GA_FDEF );
-
+        if (GAop) {
+          KNX_ADD_GA( GAop, GA_FNUM, GA_AREA, GA_FDEF );
+        }
       }
       else
       {
 
         stmp = WebServer->arg("CBop"); //option selected
-        byte CBop = stmp.toInt();
+        uint8_t CBop = stmp.toInt();
         stmp = WebServer->arg("CB_FNUM");
-        byte CB_FNUM = stmp.toInt();
+        uint8_t CB_FNUM = stmp.toInt();
         stmp = WebServer->arg("CB_AREA");
-        byte CB_AREA = stmp.toInt();
+        uint8_t CB_AREA = stmp.toInt();
         stmp = WebServer->arg("CB_FDEF");
-        byte CB_FDEF = stmp.toInt();
+        uint8_t CB_FDEF = stmp.toInt();
 
-        KNX_ADD_CB( CBop, CB_FNUM, CB_AREA, CB_FDEF );
-
+        if (CBop) {
+          KNX_ADD_CB( CBop, CB_FNUM, CB_AREA, CB_FDEF );
+        }
       }
     }
     else if ( WebServer->hasArg("btn_del_ga") )
     {
 
       stmp = WebServer->arg("btn_del_ga");
-      byte GA_NUM = stmp.toInt();
+      uint8_t GA_NUM = stmp.toInt();
 
       KNX_DEL_GA(GA_NUM);
 
@@ -674,151 +853,102 @@ void HandleKNXConfiguration()
     {
 
       stmp = WebServer->arg("btn_del_cb");
-      byte CB_NUM = stmp.toInt();
+      uint8_t CB_NUM = stmp.toInt();
 
       KNX_DEL_CB(CB_NUM);
 
     }
 
-    String page = FPSTR(HTTP_HEAD);
-    page.replace(F("{v}"), FPSTR(S_CONFIGURE_KNX));
-    page += FPSTR(HTTP_HEAD_STYLE);
-    page.replace(F("340px"), F("530px"));
-    page += FPSTR(HTTP_FORM_KNX);
-    KNX_physs_addr.value = Settings.knx_physsical_addr;
-    page.replace(F("{kna"), String(KNX_physs_addr.pa.area));
-    page.replace(F("{knl"), String(KNX_physs_addr.pa.line));
-    page.replace(F("{knm"), String(KNX_physs_addr.pa.member));
-    if ( Settings.flag.knx_enabled ) { page += F(" checked"); }
+    WSContentStart_P(S_CONFIGURE_KNX);
+    WSContentSend_P(
+      PSTR("function GAwarning()"
+          "{"
+            "var GA_FNUM=eb('GA_FNUM');"
+            "var GA_AREA=eb('GA_AREA');"
+            "var GA_FDEF=eb('GA_FDEF');"
+            "if(GA_FNUM!=null&&GA_FNUM.value=='0'&&GA_AREA.value=='0'&&GA_FDEF.value=='0'){"
+              "alert('" D_KNX_WARNING "');"
+            "}"
+          "}"
+          "function CBwarning()"
+          "{"
+            "var CB_FNUM=eb('CB_FNUM');"
+            "var CB_AREA=eb('CB_AREA');"
+            "var CB_FDEF=eb('CB_FDEF');"
+            "if(CB_FNUM!=null&&CB_FNUM.value=='0'&&CB_AREA.value=='0'&&CB_FDEF.value=='0'){"
+              "alert('" D_KNX_WARNING "');"
+            "}"
+          "}"));
+    WSContentSendStyle();
+    WSContentSend_P(HTTP_FORM_KNX, KNX_physs_addr.pa.area, KNX_physs_addr.pa.line, KNX_physs_addr.pa.member);
+    if ( Settings.flag.knx_enabled ) { WSContentSend_P(PSTR(" checked")); }
+    WSContentSend_P(HTTP_FORM_KNX1);
+    if ( Settings.flag.knx_enable_enhancement ) { WSContentSend_P(PSTR(" checked")); }
 
-    page += FPSTR(HTTP_FORM_KNX2);
-    for (byte i = 0; i < KNX_MAX_device_param ; i++)
+    WSContentSend_P(HTTP_FORM_KNX2);
+    for (uint8_t i = 0; i < KNX_MAX_device_param ; i++)
     {
       if ( device_param[i].show )
       {
-        page += FPSTR(HTTP_FORM_KNX_OPT);
-        page.replace(F("{vop}"), String(device_param[i].type));
-        page.replace(F("{nop}"), String(device_param_ga[i]));
+        WSContentSend_P(HTTP_FORM_KNX_OPT, device_param[i].type, device_param_ga[i]);
       }
     }
-    page += F("</select> -> ");
-    page += FPSTR(HTTP_FORM_KNX_GA);
-    page.replace(F("GAfnum"), F("GA_FNUM"));
-    page.replace(F("GAarea"), F("GA_AREA"));
-    page.replace(F("GAfdef"), F("GA_FDEF"));
-    page.replace(F("GAfnum"), F("GA_FNUM"));
-    page.replace(F("GAarea"), F("GA_AREA"));
-    page.replace(F("GAfdef"), F("GA_FDEF"));
-    page += FPSTR(HTTP_FORM_KNX_ADD_BTN);
-    page.replace(F("{btnval}"), String(1));
-    if (Settings.knx_GA_registered < MAX_KNX_GA) {
-      page.replace(F("btndis"), F(" "));
-    }
-    else
-    {
-      page.replace(F("btndis"), F("disabled"));
-    }
-    page.replace(F("fncbtnadd"), F("GAwarning"));
-    for (byte i = 0; i < Settings.knx_GA_registered ; ++i)
+    WSContentSend_P(PSTR("</select> -> "));
+    WSContentSend_P(HTTP_FORM_KNX_GA, "GA_FNUM", "GA_FNUM", "GA_AREA", "GA_AREA", "GA_FDEF", "GA_FDEF");
+    WSContentSend_P(HTTP_FORM_KNX_ADD_BTN, "GAwarning", (Settings.knx_GA_registered < MAX_KNX_GA) ? "" : "disabled", 1);
+    for (uint8_t i = 0; i < Settings.knx_GA_registered ; ++i)
     {
       if ( Settings.knx_GA_param[i] )
       {
-        page += FPSTR(HTTP_FORM_KNX_ADD_TABLE_ROW);
-        page.replace(F("{opval}"), String(i+1));
-        page.replace(F("{optex}"), String(device_param_ga[Settings.knx_GA_param[i]-1]));
         KNX_addr.value = Settings.knx_GA_addr[i];
-        page.replace(F("GAfnum"), String(KNX_addr.ga.area));
-        page.replace(F("GAarea"), String(KNX_addr.ga.line));
-        page.replace(F("GAfdef"), String(KNX_addr.ga.member));
+        WSContentSend_P(HTTP_FORM_KNX_ADD_TABLE_ROW, device_param_ga[Settings.knx_GA_param[i]-1], KNX_addr.ga.area, KNX_addr.ga.line, KNX_addr.ga.member, i +1);
       }
     }
 
-    page += FPSTR(HTTP_FORM_KNX3);
-    page += FPSTR(HTTP_FORM_KNX_GA);
-    page.replace(F("GAfnum"), F("CB_FNUM"));
-    page.replace(F("GAarea"), F("CB_AREA"));
-    page.replace(F("GAfdef"), F("CB_FDEF"));
-    page.replace(F("GAfnum"), F("CB_FNUM"));
-    page.replace(F("GAarea"), F("CB_AREA"));
-    page.replace(F("GAfdef"), F("CB_FDEF"));
-    page += FPSTR(HTTP_FORM_KNX4);
-    byte j;
-    for (byte i = 0; i < KNX_MAX_device_param ; i++)
+    WSContentSend_P(HTTP_FORM_KNX3);
+    WSContentSend_P(HTTP_FORM_KNX_GA, "CB_FNUM", "CB_FNUM", "CB_AREA", "CB_AREA", "CB_FDEF", "CB_FDEF");
+    WSContentSend_P(HTTP_FORM_KNX4);
+
+    uint8_t j;
+    for (uint8_t i = 0; i < KNX_MAX_device_param ; i++)
     {
       // Check How many Relays are available and add: RelayX and TogleRelayX
       if ( (i > 8) && (i < 16) ) { j=i-8; } else { j=i; }
       if ( i == 8 ) { j = 0; }
       if ( device_param[j].show )
       {
-        page += FPSTR(HTTP_FORM_KNX_OPT);
-        page.replace(F("{vop}"), String(device_param[i].type));
-        page.replace(F("{nop}"), String(device_param_cb[i]));
+        WSContentSend_P(HTTP_FORM_KNX_OPT, device_param[i].type, device_param_cb[i]);
       }
     }
-    page += F("</select> ");
-    page += FPSTR(HTTP_FORM_KNX_ADD_BTN);
-    page.replace(F("{btnval}"), String(2));
-    if (Settings.knx_CB_registered < MAX_KNX_CB) {
-      page.replace(F("btndis"), F(" "));
-    }
-    else
-    {
-      page.replace(F("btndis"), F("disabled"));
-    }
-    page.replace(F("fncbtnadd"), F("CBwarning"));
+    WSContentSend_P(PSTR("</select> "));
+    WSContentSend_P(HTTP_FORM_KNX_ADD_BTN, "CBwarning", (Settings.knx_CB_registered < MAX_KNX_CB) ? "" : "disabled", 2);
 
-    for (byte i = 0; i < Settings.knx_CB_registered ; ++i)
+    for (uint8_t i = 0; i < Settings.knx_CB_registered ; ++i)
     {
       if ( Settings.knx_CB_param[i] )
       {
-        page += FPSTR(HTTP_FORM_KNX_ADD_TABLE_ROW2);
-        page.replace(F("{opval}"), String(i+1));
-        page.replace(F("{optex}"), String(device_param_cb[Settings.knx_CB_param[i]-1]));
         KNX_addr.value = Settings.knx_CB_addr[i];
-        page.replace(F("GAfnum"), String(KNX_addr.ga.area));
-        page.replace(F("GAarea"), String(KNX_addr.ga.line));
-        page.replace(F("GAfdef"), String(KNX_addr.ga.member));
+        WSContentSend_P(HTTP_FORM_KNX_ADD_TABLE_ROW2, KNX_addr.ga.area, KNX_addr.ga.line, KNX_addr.ga.member, device_param_cb[Settings.knx_CB_param[i]-1], i +1);
       }
     }
-    page += F("</table></center></fieldset>");
-    page += F("<br/><button name='save' type='submit'>" D_SAVE "</button></form></fieldset>");
-    page += FPSTR(HTTP_BTN_CONF);
-
-    page.replace( F("</script>"),
-      F("function GAwarning()"
-        "{"
-          "var GA_FNUM = document.getElementById('GA_FNUM');"
-          "var GA_AREA = document.getElementById('GA_AREA');"
-          "var GA_FDEF = document.getElementById('GA_FDEF');"
-          "if ( GA_FNUM != null && GA_FNUM.value == '0' && GA_AREA.value == '0' && GA_FDEF.value == '0' ) {"
-            "alert('" D_KNX_WARNING "');"
-          "}"
-        "}"
-        "function CBwarning()"
-        "{"
-          "var CB_FNUM = document.getElementById('CB_FNUM');"
-          "var CB_AREA = document.getElementById('CB_AREA');"
-          "var CB_FDEF = document.getElementById('CB_FDEF');"
-          "if ( CB_FNUM != null && CB_FNUM.value == '0' && CB_AREA.value == '0' && CB_FDEF.value == '0' ) {"
-            "alert('" D_KNX_WARNING "');"
-          "}"
-        "}"
-      "</script>") );
-    ShowPage(page);
+    WSContentSend_P(PSTR("</table></center></fieldset>"));
+    WSContentSend_P(HTTP_FORM_END);
+    WSContentSpaceButton(BUTTON_CONFIGURATION);
+    WSContentStop();
   }
 
 }
 
 
-void KNX_Save_Settings()
+void KNX_Save_Settings(void)
 {
   String stmp;
   address_t KNX_addr;
 
   Settings.flag.knx_enabled = WebServer->hasArg("b1");
-  snprintf_P(log_data, sizeof(log_data), PSTR(D_LOG_KNX D_ENABLED ": %d "),
-   Settings.flag.knx_enabled);
-  AddLog(LOG_LEVEL_DEBUG);
+  Settings.flag.knx_enable_enhancement = WebServer->hasArg("b2");
+  AddLog_P2(LOG_LEVEL_DEBUG, PSTR(D_LOG_KNX D_ENABLED ": %d, " D_KNX_ENHANCEMENT ": %d"),
+   Settings.flag.knx_enabled, Settings.flag.knx_enable_enhancement );
 
   stmp = WebServer->arg("area");
   KNX_addr.pa.area = stmp.toInt();
@@ -828,58 +958,295 @@ void KNX_Save_Settings()
   KNX_addr.pa.member = stmp.toInt();
   Settings.knx_physsical_addr = KNX_addr.value;
   knx.physical_address_set( KNX_addr ); // Set Physical KNX Address of the device
-  snprintf_P(log_data, sizeof(log_data), PSTR(D_LOG_KNX D_KNX_PHYSICAL_ADDRESS ": %d.%d.%d "),
+  AddLog_P2(LOG_LEVEL_DEBUG, PSTR(D_LOG_KNX D_KNX_PHYSICAL_ADDRESS ": %d.%d.%d "),
    KNX_addr.pa.area, KNX_addr.pa.line, KNX_addr.pa.member );
-  AddLog(LOG_LEVEL_DEBUG);
 
-  snprintf_P(log_data, sizeof(log_data), PSTR(D_LOG_KNX "GA: %d"),
+  AddLog_P2(LOG_LEVEL_DEBUG, PSTR(D_LOG_KNX "GA: %d"),
    Settings.knx_GA_registered );
-  AddLog(LOG_LEVEL_DEBUG);
-  for (byte i = 0; i < Settings.knx_GA_registered ; ++i)
+  for (uint8_t i = 0; i < Settings.knx_GA_registered ; ++i)
   {
     KNX_addr.value = Settings.knx_GA_addr[i];
-    snprintf_P(log_data, sizeof(log_data), PSTR(D_LOG_KNX "GA #%d: %s " D_TO " %d/%d/%d"),
+    AddLog_P2(LOG_LEVEL_DEBUG, PSTR(D_LOG_KNX "GA #%d: %s " D_TO " %d/%d/%d"),
      i+1, device_param_ga[Settings.knx_GA_param[i]-1],
      KNX_addr.ga.area, KNX_addr.ga.line, KNX_addr.ga.member );
-    AddLog(LOG_LEVEL_DEBUG);
+
   }
 
-  snprintf_P(log_data, sizeof(log_data), PSTR(D_LOG_KNX "CB: %d"),
+  AddLog_P2(LOG_LEVEL_DEBUG, PSTR(D_LOG_KNX "CB: %d"),
    Settings.knx_CB_registered );
-  AddLog(LOG_LEVEL_DEBUG);
-  for (byte i = 0; i < Settings.knx_CB_registered ; ++i)
+  for (uint8_t i = 0; i < Settings.knx_CB_registered ; ++i)
   {
     KNX_addr.value = Settings.knx_CB_addr[i];
-    snprintf_P(log_data, sizeof(log_data), PSTR(D_LOG_KNX "CB #%d: %d/%d/%d " D_TO " %s"),
+    AddLog_P2(LOG_LEVEL_DEBUG, PSTR(D_LOG_KNX "CB #%d: %d/%d/%d " D_TO " %s"),
      i+1,
      KNX_addr.ga.area, KNX_addr.ga.line, KNX_addr.ga.member,
      device_param_cb[Settings.knx_CB_param[i]-1] );
-    AddLog(LOG_LEVEL_DEBUG);
   }
 }
 
+#endif  // USE_KNX_WEB_MENU
 #endif  // USE_WEBSERVER
+
+
+bool KnxCommand(void)
+{
+  char command[CMDSZ];
+  uint8_t index = XdrvMailbox.index;
+  int command_code = GetCommandCode(command, sizeof(command), XdrvMailbox.topic, kKnxCommands);
+
+  if (-1 == command_code) { return false; } // Unknown command
+
+  else if ((CMND_KNXTXCMND == command_code) && (index > 0) && (index <= MAX_KNXTX_CMNDS) && (XdrvMailbox.data_len > 0)) {
+    // index <- KNX SLOT to use
+    // XdrvMailbox.payload <- data to send
+    if (!(Settings.flag.knx_enabled)) { return false; }
+    // Search all the registered GA that has that output (variable: KNX SLOTx) as parameter
+    uint8_t i = KNX_GA_Search(index + KNX_SLOT1 -1);
+    while ( i != KNX_Empty ) {
+      KNX_addr.value = Settings.knx_GA_addr[i];
+      knx.write_1bit(KNX_addr, !(XdrvMailbox.payload == 0));
+      if (Settings.flag.knx_enable_enhancement) {
+        knx.write_1bit(KNX_addr, !(XdrvMailbox.payload == 0));
+        knx.write_1bit(KNX_addr, !(XdrvMailbox.payload == 0));
+      }
+
+      AddLog_P2(LOG_LEVEL_INFO, PSTR(D_LOG_KNX "%s = %d " D_SENT_TO " %d.%d.%d"),
+       device_param_ga[index + KNX_SLOT1 -2], !(XdrvMailbox.payload == 0),
+       KNX_addr.ga.area, KNX_addr.ga.line, KNX_addr.ga.member);
+
+      i = KNX_GA_Search(index + KNX_SLOT1 -1, i + 1);
+    }
+    snprintf_P (mqtt_data, sizeof(mqtt_data), PSTR("{\"%s%d\":\"%s\"}"),
+      command, index, XdrvMailbox.data );
+  }
+
+  else if ((CMND_KNXTXVAL == command_code) && (index > 0) && (index <= MAX_KNXTX_CMNDS) && (XdrvMailbox.data_len > 0)) {
+    // index <- KNX SLOT to use
+    // XdrvMailbox.payload <- data to send
+    if (!(Settings.flag.knx_enabled)) { return false; }
+    // Search all the registered GA that has that output (variable: KNX SLOTx) as parameter
+    uint8_t i = KNX_GA_Search(index + KNX_SLOT1 -1);
+    while ( i != KNX_Empty ) {
+      KNX_addr.value = Settings.knx_GA_addr[i];
+
+      float tempvar = CharToDouble(XdrvMailbox.data);
+      dtostrfd(tempvar,2,XdrvMailbox.data);
+
+      knx.write_2byte_float(KNX_addr, tempvar);
+      if (Settings.flag.knx_enable_enhancement) {
+        knx.write_2byte_float(KNX_addr, tempvar);
+        knx.write_2byte_float(KNX_addr, tempvar);
+      }
+
+      AddLog_P2(LOG_LEVEL_INFO, PSTR(D_LOG_KNX "%s = %s " D_SENT_TO " %d.%d.%d"),
+       device_param_ga[index + KNX_SLOT1 -2], XdrvMailbox.data,
+       KNX_addr.ga.area, KNX_addr.ga.line, KNX_addr.ga.member);
+
+      i = KNX_GA_Search(index + KNX_SLOT1 -1, i + 1);
+    }
+    snprintf_P (mqtt_data, sizeof(mqtt_data), PSTR("{\"%s%d\":\"%s\"}"),
+      command, index, XdrvMailbox.data );
+  }
+
+  else if (CMND_KNX_ENABLED == command_code) {
+    if (!XdrvMailbox.data_len) {
+      if (Settings.flag.knx_enabled) {
+        snprintf_P(XdrvMailbox.data, sizeof(XdrvMailbox.data), PSTR("1"));
+      } else {
+        snprintf_P(XdrvMailbox.data, sizeof(XdrvMailbox.data), PSTR("0"));
+      }
+    } else {
+      if (XdrvMailbox.payload == 1) {
+        Settings.flag.knx_enabled = 1;
+      } else if (XdrvMailbox.payload == 0) {
+        Settings.flag.knx_enabled = 0;
+      } else { return false; }  // Incomplete command
+    }
+    snprintf_P (mqtt_data, sizeof(mqtt_data), PSTR("{\"%s\":\"%s\"}"),
+      command, XdrvMailbox.data );
+  }
+
+  else if (CMND_KNX_ENHANCED == command_code) {
+    if (!XdrvMailbox.data_len) {
+      if (Settings.flag.knx_enable_enhancement) {
+        snprintf_P(XdrvMailbox.data, sizeof(XdrvMailbox.data), PSTR("1"));
+      } else {
+        snprintf_P(XdrvMailbox.data, sizeof(XdrvMailbox.data), PSTR("0"));
+      }
+    } else {
+      if (XdrvMailbox.payload == 1) {
+        Settings.flag.knx_enable_enhancement = 1;
+      } else if (XdrvMailbox.payload == 0) {
+        Settings.flag.knx_enable_enhancement = 0;
+      } else { return false; }  // Incomplete command
+    }
+    snprintf_P (mqtt_data, sizeof(mqtt_data), PSTR("{\"%s\":\"%s\"}"),
+      command, XdrvMailbox.data );
+  }
+
+  else if (CMND_KNX_PA == command_code) {
+    if (XdrvMailbox.data_len) {
+      if (strstr(XdrvMailbox.data, ".")) {     // Process parameter entry
+        char sub_string[XdrvMailbox.data_len];
+
+        int pa_area = atoi(subStr(sub_string, XdrvMailbox.data, ".", 1));
+        int pa_line = atoi(subStr(sub_string, XdrvMailbox.data, ".", 2));
+        int pa_member = atoi(subStr(sub_string, XdrvMailbox.data, ".", 3));
+
+        if ( ((pa_area == 0) && (pa_line == 0) && (pa_member == 0))
+             || (pa_area > 15) || (pa_line > 15) || (pa_member > 255) ) {
+               snprintf_P (mqtt_data, sizeof(mqtt_data), PSTR("{\"%s\":\"" D_ERROR "\"}"),
+                 command );
+               return true;
+        }  // Invalid command
+
+        KNX_addr.pa.area = pa_area;
+        KNX_addr.pa.line = pa_line;
+        KNX_addr.pa.member = pa_member;
+        Settings.knx_physsical_addr = KNX_addr.value;
+      }
+    }
+    KNX_addr.value = Settings.knx_physsical_addr;
+    snprintf_P (mqtt_data, sizeof(mqtt_data), PSTR("{\"%s\":\"%d.%d.%d\"}"),
+      command, KNX_addr.pa.area, KNX_addr.pa.line, KNX_addr.pa.member );
+  }
+
+  else if ((CMND_KNX_GA == command_code) && (index > 0) && (index <= MAX_KNX_GA)) {
+    if (XdrvMailbox.data_len) {
+      if (strstr(XdrvMailbox.data, ",")) {     // Process parameter entry
+        char sub_string[XdrvMailbox.data_len];
+
+        int ga_option = atoi(subStr(sub_string, XdrvMailbox.data, ",", 1));
+        int ga_area = atoi(subStr(sub_string, XdrvMailbox.data, ",", 2));
+        int ga_line = atoi(subStr(sub_string, XdrvMailbox.data, ",", 3));
+        int ga_member = atoi(subStr(sub_string, XdrvMailbox.data, ",", 4));
+
+        if ( ((ga_area == 0) && (ga_line == 0) && (ga_member == 0))
+          || (ga_area > 31) || (ga_line > 7) || (ga_member > 255)
+          || (ga_option < 0) || ((ga_option > KNX_MAX_device_param ) && (ga_option != KNX_Empty))
+          || (!device_param[ga_option-1].show) ) {
+               snprintf_P (mqtt_data, sizeof(mqtt_data), PSTR("{\"%s\":\"" D_ERROR "\"}"), command );
+               return true;
+        }  // Invalid command
+
+        KNX_addr.ga.area = ga_area;
+        KNX_addr.ga.line = ga_line;
+        KNX_addr.ga.member = ga_member;
+
+        if ( index > Settings.knx_GA_registered ) {
+          Settings.knx_GA_registered ++;
+          index = Settings.knx_GA_registered;
+        }
+
+        Settings.knx_GA_addr[index -1] = KNX_addr.value;
+        Settings.knx_GA_param[index -1] = ga_option;
+      } else {
+        if ( (XdrvMailbox.payload <= Settings.knx_GA_registered) && (XdrvMailbox.payload > 0) ) {
+          index = XdrvMailbox.payload;
+        } else {
+          snprintf_P (mqtt_data, sizeof(mqtt_data), PSTR("{\"%s\":\"" D_ERROR "\"}"), command );
+          return true;
+        }
+      }
+      if ( index <= Settings.knx_GA_registered ) {
+        KNX_addr.value = Settings.knx_GA_addr[index -1];
+        snprintf_P (mqtt_data, sizeof(mqtt_data), PSTR("{\"%s%d\":\"%s, %d/%d/%d\"}"),
+          command, index, device_param_ga[Settings.knx_GA_param[index-1]-1],
+          KNX_addr.ga.area, KNX_addr.ga.line, KNX_addr.ga.member );
+      }
+    } else {
+      snprintf_P (mqtt_data, sizeof(mqtt_data), PSTR("{\"%s\":\"%d\"}"),
+        command, Settings.knx_GA_registered );
+    }
+  }
+
+  else if ((CMND_KNX_CB == command_code) && (index > 0) && (index <= MAX_KNX_CB)) {
+    if (XdrvMailbox.data_len) {
+      if (strstr(XdrvMailbox.data, ",")) {     // Process parameter entry
+        char sub_string[XdrvMailbox.data_len];
+
+        int cb_option = atoi(subStr(sub_string, XdrvMailbox.data, ",", 1));
+        int cb_area = atoi(subStr(sub_string, XdrvMailbox.data, ",", 2));
+        int cb_line = atoi(subStr(sub_string, XdrvMailbox.data, ",", 3));
+        int cb_member = atoi(subStr(sub_string, XdrvMailbox.data, ",", 4));
+
+        if ( ((cb_area == 0) && (cb_line == 0) && (cb_member == 0))
+          || (cb_area > 31) || (cb_line > 7) || (cb_member > 255)
+          || (cb_option < 0) || ((cb_option > KNX_MAX_device_param ) && (cb_option != KNX_Empty))
+          || (!device_param[cb_option-1].show) ) {
+               snprintf_P (mqtt_data, sizeof(mqtt_data), PSTR("{\"%s\":\"" D_ERROR "\"}"), command );
+               return true;
+        }  // Invalid command
+
+        KNX_addr.ga.area = cb_area;
+        KNX_addr.ga.line = cb_line;
+        KNX_addr.ga.member = cb_member;
+
+        if ( index > Settings.knx_CB_registered ) {
+          Settings.knx_CB_registered ++;
+          index = Settings.knx_CB_registered;
+        }
+
+        Settings.knx_CB_addr[index -1] = KNX_addr.value;
+        Settings.knx_CB_param[index -1] = cb_option;
+      } else {
+        if ( (XdrvMailbox.payload <= Settings.knx_CB_registered) && (XdrvMailbox.payload > 0) ) {
+          index = XdrvMailbox.payload;
+        } else {
+          snprintf_P (mqtt_data, sizeof(mqtt_data), PSTR("{\"%s\":\"" D_ERROR "\"}"), command );
+          return true;
+        }
+      }
+      if ( index <= Settings.knx_CB_registered ) {
+        KNX_addr.value = Settings.knx_CB_addr[index -1];
+        snprintf_P (mqtt_data, sizeof(mqtt_data), PSTR("{\"%s%d\":\"%s, %d/%d/%d\"}"),
+          command, index, device_param_cb[Settings.knx_CB_param[index-1]-1],
+          KNX_addr.ga.area, KNX_addr.ga.line, KNX_addr.ga.member );
+      }
+    } else {
+      snprintf_P (mqtt_data, sizeof(mqtt_data), PSTR("{\"%s\":\"%d\"}"),
+        command, Settings.knx_CB_registered );
+    }
+  }
+
+  else { return false; }  // Incomplete command
+
+  return true;
+}
 
 
 /*********************************************************************************************\
  * Interface
 \*********************************************************************************************/
 
-#define XDRV_11
-
-boolean Xdrv11(byte function)
+bool Xdrv11(uint8_t function)
 {
-  boolean result = false;
+  bool result = false;
     switch (function) {
-      case FUNC_INIT:
+      case FUNC_PRE_INIT:
         KNX_INIT();
         break;
-      case FUNC_LOOP:
-        knx.loop();  // Process knx events
+#ifdef USE_WEBSERVER
+#ifdef USE_KNX_WEB_MENU
+      case FUNC_WEB_ADD_BUTTON:
+        WSContentSend_P(HTTP_BTN_MENU_KNX);
         break;
-//      case FUNC_COMMAND:
-//        result = KNXCommand();
-//        break;
+      case FUNC_WEB_ADD_HANDLER:
+        WebServer->on("/kn", HandleKNXConfiguration);
+        break;
+#endif // USE_KNX_WEB_MENU
+#endif  // USE_WEBSERVER
+      case FUNC_LOOP:
+        if (!global_state.wifi_down) { knx.loop(); }  // Process knx events
+        break;
+      case FUNC_EVERY_50_MSECOND:
+        if (toggle_inhibit) {
+          toggle_inhibit--;
+        }
+        break;
+      case FUNC_COMMAND:
+        result = KnxCommand();
+        break;
 //      case FUNC_SET_POWER:
 //        break;
     }
